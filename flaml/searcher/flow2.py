@@ -3,6 +3,7 @@
  * Licensed under the MIT License. See LICENSE file in the
  * project root for license information.
 '''
+from flaml.tune.sample import Domain
 from typing import Dict, Optional, Tuple
 import numpy as np
 try:
@@ -14,8 +15,9 @@ try:
     from ray.tune.utils.util import flatten_dict, unflatten_dict
 except (ImportError, AssertionError):
     from .suggestion import Searcher
-    from .variant_generator import generate_variants, flatten_dict, unflatten_dict
+    from .variant_generator import generate_variants
     from ..tune import sample
+    from ..tune.trial import flatten_dict, unflatten_dict
 from ..tune.space import complete_config, denormalize, normalize
 
 
@@ -94,7 +96,7 @@ class FLOW2(Searcher):
         self.space = space or {}
         self._space = flatten_dict(self.space, prevent_delimiter=True)
         self._random = np.random.RandomState(seed)
-        self._seed = seed
+        self.seed = seed
         self.init_config = init_config
         self.best_config = flatten_dict(init_config)
         self.prune_attr = prune_attr
@@ -140,8 +142,8 @@ class FLOW2(Searcher):
                 if str(sampler) != 'Normal':
                     self._bounded_keys.append(key)
         if not hier:
-            self._space_keys = sorted(self._space.keys())
-        self._hierarchical = hier
+            self._space_keys = sorted(self._tunable_keys)
+        self.hierarchical = hier
         if (self.prune_attr and self.prune_attr not in self._space
                 and self.max_resource):
             self.min_resource = self.min_resource or self._min_resource()
@@ -252,10 +254,10 @@ class FLOW2(Searcher):
             init_config, self.metric, self.mode,
             space, self.prune_attr,
             self.min_resource, self.max_resource,
-            self.resource_multiple_factor, self.cost_attr, self._seed + 1)
+            self.resource_multiple_factor, self.cost_attr, self.seed + 1)
         flow2.best_obj = obj * self.metric_op  # minimize internally
         flow2.cost_incumbent = cost
-        self._seed += 1
+        self.seed += 1
         return flow2
 
     def normalize(self, config, recursive=False) -> Dict:
@@ -499,18 +501,28 @@ class FLOW2(Searcher):
         else:
             space = self._space
         value_list = []
-        keys = sorted(config.keys()) if self._hierarchical else self._space_keys
+        # self._space_keys doesn't contain keys with const values,
+        # e.g., "eval_metric": ["logloss", "error"].
+        keys = sorted(config.keys()) if self.hierarchical else self._space_keys
         for key in keys:
             value = config[key]
             if key == self.prune_attr:
                 value_list.append(value)
-            # else key must be in self.space
-            # get rid of list type or constant,
-            # e.g., "eval_metric": ["logloss", "error"]
-            elif isinstance(space[key], sample.Integer):
-                value_list.append(int(round(value)))
             else:
-                value_list.append(value)
+                # key must be in space
+                domain = space[key]
+                if self.hierarchical:
+                    # can't remove constant for hierarchical search space,
+                    # e.g., learner
+                    if not (domain is None or type(domain) in (str, int, float)
+                            or isinstance(domain, sample.Domain)):
+                        # not domain or hashable
+                        # get rid of list type for hierarchical search space.
+                        continue
+                if isinstance(domain, sample.Integer):
+                    value_list.append(int(round(value)))
+                else:
+                    value_list.append(value)
         return tuple(value_list)
 
     @property
@@ -532,8 +544,9 @@ class FLOW2(Searcher):
             return False
         for key in self._unordered_cat_hp:
             # unordered cat choice is hard to reach by chance
-            if config1[key] != config2[key]:
+            if config1[key] != config2.get(key):
                 return False
         delta = np.array(
-            [incumbent1[key] - incumbent2[key] for key in self._tunable_keys])
+            [incumbent1[key] - incumbent2.get(key, np.inf)
+             for key in self._tunable_keys])
         return np.linalg.norm(delta) <= self.step

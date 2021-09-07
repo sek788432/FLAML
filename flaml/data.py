@@ -120,7 +120,7 @@ def get_output_from_log(filename, time_budget):
         time_budget: A float of the time budget in seconds
 
     Returns:
-        training_time_list: A list of the finished time of each logged iter
+        search_time_list: A list of the finished time of each logged iter
         best_error_list:
             A list of the best validation error after each logged iter
         error_list: A list of the validation error of each logged iter
@@ -132,9 +132,8 @@ def get_output_from_log(filename, time_budget):
     best_config = None
     best_learner = None
     best_val_loss = float('+inf')
-    training_duration = 0.0
 
-    training_time_list = []
+    search_time_list = []
     config_list = []
     best_error_list = []
     error_list = []
@@ -142,23 +141,22 @@ def get_output_from_log(filename, time_budget):
     best_config_list = []
     with training_log_reader(filename) as reader:
         for record in reader.records():
-            time_used = record.total_search_time
-            training_duration = time_used
+            time_used = record.wall_clock_time
             val_loss = record.validation_loss
             config = record.config
             learner = record.learner.split('_')[0]
             sample_size = record.sample_size
-            train_loss = record.logged_metric
+            metric = record.logged_metric
 
-            if time_used < time_budget:
+            if time_used < time_budget and np.isfinite(val_loss):
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_config = config
                     best_learner = learner
                     best_config_list.append(best_config)
-                training_time_list.append(training_duration)
+                search_time_list.append(time_used)
                 best_error_list.append(best_val_loss)
-                logged_metric_list.append(train_loss)
+                logged_metric_list.append(metric)
                 error_list.append(val_loss)
                 config_list.append({"Current Learner": learner,
                                     "Current Sample": sample_size,
@@ -166,7 +164,7 @@ def get_output_from_log(filename, time_budget):
                                     "Best Learner": best_learner,
                                     "Best Hyper-parameters": best_config})
 
-    return (training_time_list, best_error_list, error_list, config_list,
+    return (search_time_list, best_error_list, error_list, config_list,
             logged_metric_list)
 
 
@@ -244,8 +242,12 @@ class DataTransformer:
                 X[cat_columns] = X[cat_columns].astype('category')
             if num_columns:
                 X_num = X[num_columns]
-                if drop and np.issubdtype(X_num.columns.dtype, np.integer):
+                if np.issubdtype(X_num.columns.dtype, np.integer) and (
+                    drop or min(X_num.columns) != 0
+                    or max(X_num.columns) != X_num.shape[1] - 1
+                ):
                     X_num.columns = range(X_num.shape[1])
+                    drop = True
                 else:
                     drop = False
                 from sklearn.impute import SimpleImputer
@@ -259,12 +261,12 @@ class DataTransformer:
                 cat_columns, num_columns, datetime_columns
             self._drop = drop
 
-        if task == 'regression':
-            self.label_transformer = None
-        else:
+        if task in ('binary', 'multi', 'classification'):
             from sklearn.preprocessing import LabelEncoder
             self.label_transformer = LabelEncoder()
             y = self.label_transformer.fit_transform(y)
+        else:
+            self.label_transformer = None
         return X, y
 
     def transform(self, X):
@@ -304,3 +306,8 @@ class DataTransformer:
                     X_num.columns = range(X_num.shape[1])
                 X[num_columns] = self.transformer.transform(X_num)
         return X
+
+
+def group_counts(groups):
+    _, i, c = np.unique(groups, return_counts=True, return_index=True)
+    return c[np.argsort(i)]
